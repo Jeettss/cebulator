@@ -1,0 +1,12 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+    <Frame name="CebulatorCombatFrame" parent="UIParent">
+        <Scripts>
+            <OnLoad>
+                self:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+            </OnLoad>
+            <OnEvent>
+                Cebulator_OnCombatLog(arg1)
+            </OnEvent>
+        </Scripts>
+    </Frame>
+</Ui>

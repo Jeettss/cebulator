@@ -1,0 +1,21 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+
+    <Button name="CebulatorCoinBtn" parent="UIParent" inherits="SecureActionButtonTemplate" hidden="true">
+        <Size x="48" y="48"/>
+        <Attributes>
+            <Attribute name="type1" type="string" value="macro"/>
+            <Attribute name="macrotext1" type="string" value=""/>
+        </Attributes>
+        <Layers>
+            <Layer level="ARTWORK">
+                <Texture name="$parentIcon" file="Interface\AddOns\Cebulator\cebulator" setAllPoints="true"/>
+            </Layer>
+        </Layers>
+        <Scripts>
+            <OnLoad>
+                self:RegisterForClicks("LeftButtonUp")
+            </OnLoad>
+        </Scripts>
+    </Button>
+
+</Ui>

@@ -1,0 +1,19 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+
+    <Frame name="CebulatorEventFrame" parent="UIParent">
+        <Scripts>
+            <OnLoad>
+                self:RegisterEvent("ADDON_LOADED")
+                self:RegisterEvent("PLAYER_LOGIN")
+                self:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+                self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+                self:RegisterEvent("CHAT_MSG_LOOT")
+                self:RegisterEvent("LOOT_CLOSED")
+            </OnLoad>
+            <OnEvent>
+                Cebulator_OnEvent(self, event, ...)
+            </OnEvent>
+        </Scripts>
+    </Frame>
+
+</Ui>
