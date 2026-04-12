@@ -1,6 +1,6 @@
 ## Interface: 120001
 ## Title: Cebulator
-## Version: 1.01
+## Version: 1.02
 ## Author: Malf
 ## Notes: Midnight Renowned Beasts kill and loot tracker
 ## SavedVariables: CebulatorDB

@@ -1,9 +1,19 @@
 local MOBS = {
-    ["Eversong Woods"] = { mobs = { "Gloomclaw" },               pin = { x = 0.4200, y = 0.7944 } },
-    ["Zul'Aman"]       = { mobs = { "Silverscale" },             pin = nil },
-    ["Harandar"]       = { mobs = { "Lumenfin" },                pin = nil },
-    ["Voidstorm"]      = { mobs = { "Umbrafang", "Netherscythe" }, pin = nil },
+    ["Eversong Woods"] = { mobs = { "Gloomclaw" },               pin = { x = 0.4200, y = 0.7944 }, mapID = 2395 },
+    ["Zul'Aman"]       = { mobs = { "Silverscale" },             pin = { x = 0.4741, y = 0.5370 }, mapID = 2437 },
+    ["Harandar"]       = { mobs = { "Lumenfin" },                pin = { x = 0.6652, y = 0.4750 }, mapID = 2413 },
+    ["Voidstorm"]      = { mobs = { "Umbrafang", "Netherscythe" }, pin = nil, pins = { Umbrafang = { x = 0.5544, y = 0.6527 }, Netherscythe = { x = 0.4330, y = 0.8266 } }, mapID = 2405 },
 }
+local ZONE_ALIASES = {
+    ["Atal'Aman"]       = "Zul'Aman",
+    ["The Den"]         = "Harandar",
+    ["Silvermoon City"] = "Eversong Woods",
+    ["Masters' Perch"]  = "Voidstorm",
+}
+local function getZone()
+    local zone = GetRealZoneText()
+    return ZONE_ALIASES[zone] or zone
+end
 local ITEMS = {
     [238529] = "Majestic Hide",
     [238528] = "Majestic Claw",
@@ -17,6 +27,7 @@ local DEFAULT_COIN_POS = { point = "CENTER", x = 200, y = 0 }
 local LDB, LibDBIcon, CebulatorLDB
 local lastKilledMob = nil
 local coinBtn
+local waypointSet = false
 
 local function today()
     local utc     = time() + 2 * 3600
@@ -105,24 +116,72 @@ end
 
 local MACRO_NAME = "CebTarget"
 
+local function getPinForMob(zoneData, mobName)
+    if zoneData.pins and zoneData.pins[mobName] then return zoneData.pins[mobName] end
+    if zoneData.pin then return zoneData.pin end
+    return nil
+end
+
 local function setWaypoint()
-    local zone = GetZoneText()
+    local zone = getZone()
     local zoneData = MOBS[zone]
-    if not zoneData or not zoneData.pin then return end
-    local mapID = C_Map.GetBestMapForUnit("player")
+    if not zoneData then
+        C_Map.ClearUserWaypoint()
+        return
+    end
+
+    -- sprawdź czy wszystkie moby zabite
+    local allKilled = true
+    for _, mob in ipairs(zoneData.mobs or {}) do
+        if not getMobData(mob).killed then allKilled = false; break end
+    end
+    if allKilled then
+        for _, mob in ipairs(zoneData.mobs or {}) do
+            local pin = getPinForMob(zoneData, mob)
+            if pin then
+                print(string.format("|cffaaaaaa[Cebulator] %s (%s, %.2f, %.2f) already killed today.|r", mob, zone, pin.x * 100, pin.y * 100))
+            else
+                print(string.format("|cffaaaaaa[Cebulator] %s (%s) already killed today.|r", mob, zone))
+            end
+        end
+        return
+    end
+
+    if waypointSet then return end
+    local mapID = zoneData.mapID
     if not mapID then return end
-    local point = UiMapPoint.CreateFromCoordinates(mapID, zoneData.pin.x, zoneData.pin.y)
+    local pin = zoneData.pin
+    local targetMob = zoneData.mobs and zoneData.mobs[1]
+    if zoneData.pins then
+        local umbrafangKilled = getMobData("Umbrafang").killed
+        if umbrafangKilled then
+            pin = zoneData.pins.Netherscythe
+            targetMob = "Netherscythe"
+        else
+            pin = zoneData.pins.Umbrafang
+            targetMob = "Umbrafang"
+        end
+    end
+    if not pin then return end
+    local point = UiMapPoint.CreateFromCoordinates(mapID, pin.x, pin.y)
     C_Map.SetUserWaypoint(point)
     C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+    waypointSet = true
+    print(string.format("|cffffff00Cebulator:|r Setting waypoint to %s (%s, %.2f, %.2f)", targetMob or "?", zone, pin.x * 100, pin.y * 100))
 end
 
 local function updateTargetMacro()
-    local zone = GetZoneText()
+    local zone = getZone()
     local zoneData = MOBS[zone]
     local mobs = zoneData and zoneData.mobs
     local body = ""
     if mobs then
-        for _, mob in ipairs(mobs) do body = body .. "/target " .. mob .. "\n" end
+        local filteredMobs = mobs
+        if zone == "Voidstorm" then
+            local umbrafangKilled = getMobData("Umbrafang").killed
+            filteredMobs = { umbrafangKilled and "Netherscythe" or "Umbrafang" }
+        end
+        for _, mob in ipairs(filteredMobs) do body = body .. "/target " .. mob .. "\n" end
     end
     local idx = GetMacroIndexByName(MACRO_NAME)
     if idx == 0 then
@@ -181,7 +240,7 @@ local function setup()
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Cebulator")
         GameTooltip:AddLine(" ")
-        local zone = GetZoneText()
+        local zone = getZone()
         local zoneData = MOBS[zone]
         local mobs = zoneData and zoneData.mobs
         if mobs then
@@ -251,6 +310,23 @@ function Cebulator_OnCombatLog(msg)
     end
 end
 
+SLASH_CEBULATOR1 = "/cebulator"
+SlashCmdList["CEBULATOR"] = function(msg)
+    local cmd = msg:lower()
+    if cmd == "total reset" then
+        CebulatorDB.total = {}
+        print("|cffffff00Cebulator:|r Total account summary reset.")
+    elseif cmd == "daily reset" then
+        CebulatorDB[today()] = {}
+        print("|cffffff00Cebulator:|r Daily account summary reset.")
+    else
+        print("|cffffff00Cebulator commands:|r")
+        print("  /cebulator total reset - reset total account summary")
+        print("  /cebulator daily reset - reset daily account summary")
+        print("  /cebulator help - show this help")
+    end
+end
+
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
@@ -264,9 +340,21 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         initDB()
     elseif event == "PLAYER_LOGIN" then
         setup()
+        local zone = getZone()
+        local zoneData = MOBS[zone]
+        if zoneData and not zoneData.mapID then
+            zoneData.mapID = C_Map.GetBestMapForUnit("player")
+        end
     elseif event == "ZONE_CHANGED_NEW_AREA" then
+        waypointSet = false
         if coinBtn then updateTargetMacro() end
+        local zone = getZone()
+        local zoneData = MOBS[zone]
+        if zoneData and not zoneData.mapID then
+            zoneData.mapID = C_Map.GetBestMapForUnit("player")
+        end
     elseif event == "CHAT_MSG_LOOT" then
+        if not lastKilledMob then return end
         for itemId in pairs(ITEMS) do
             local itemStr = "item:" .. itemId
             local s, e = arg1:find(itemStr)
@@ -291,6 +379,7 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         if targetName and TRACKED_MOBS[targetName] then
             getMobData(targetName).killed = true
             lastKilledMob = targetName
+            if targetName == "Umbrafang" then waypointSet = false end
         end
     elseif event == "LOOT_CLOSED" then
         lastKilledMob = nil
