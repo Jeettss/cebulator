@@ -1,6 +1,6 @@
 ## Interface: 120001
 ## Title: Cebulator
-## Version: 1.02
+## Version: 1.04
 ## Author: Malf
 ## Notes: Midnight Renowned Beasts kill and loot tracker
 ## SavedVariables: CebulatorDB
@@ -10,5 +10,4 @@ libs\LibStub\LibStub.lua
 libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
 libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
 libs\LibDBIcon-1.0\LibDBIcon-1.0.lua
-CebulatorCombat.xml
 Cebulator.lua
