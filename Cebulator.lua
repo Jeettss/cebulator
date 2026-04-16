@@ -33,6 +33,7 @@ local MOB_DROPS = {
 local DEFAULT_COIN_POS = { point = "CENTER", x = 200, y = 0 }
 local LDB, LibDBIcon, CebulatorLDB
 local lastKilledMob = nil
+local pendingKills = {}  -- mobName = true for beasts killed but not yet looted
 local lastLootedMob = nil
 local lastLootedGUID = nil
 local coinBtn
@@ -81,8 +82,8 @@ local function guildEncode()
     local charName = UnitName("player")
     local parts = {}
 
-    -- part 0: btag~charName
-    parts[1] = btag .. "~" .. charName
+    -- part 0: btag~charName~day~week
+    parts[1] = btag .. "~" .. charName .. "~" .. d .. "~" .. w
 
     local dk = CebulatorDB.dailyKills[d]
     local killParts = {}
@@ -107,9 +108,9 @@ local function guildEncode()
     local bl = CebulatorDB.badluck
     local blParts = {}
     for itemId in pairs(ITEMS) do
-        local cur = bl.current[itemId] or 0
-        if cur > 0 then
-            blParts[#blParts+1] = itemId .. "=" .. cur
+        local best = bl.best[itemId] or 0
+        if best > 0 then
+            blParts[#blParts+1] = itemId .. "=" .. best
         end
     end
     parts[4] = table.concat(blParts, ",")
@@ -180,11 +181,19 @@ local function guildDecode(payload)
     end
 
     local identStr = segments[2] or ""
-    local btag, charName = identStr:match("^(.+)~(.+)$")
-    if not btag then return end
+    local btag, charName, inDay, inWeek = identStr:match("^(.+)~(.+)~(.+)~(.+)$")
+    if not btag then
+        -- fallback for old format without day/week
+        btag, charName = identStr:match("^(.+)~(.+)$")
+        if not btag then return end
+        inDay = today()
+        inWeek = thisWeek()
+    end
 
-    guildData[btag] = {
+    local newData = {
         name = charName,
+        day = inDay,
+        week = inWeek,
         kills = parseKV(segments[3] or ""),
         loot = parseKV(segments[4] or ""),
         badluck = parseKV(segments[5] or ""),
@@ -192,6 +201,57 @@ local function guildDecode(payload)
         weekLoot = parseKV(segments[7] or ""),
         weekBadluck = parseKV(segments[8] or ""),
     }
+
+    -- merge with existing data using day/week awareness
+    local existing = guildData[btag]
+    if existing then
+        local function mergeMax(old, new)
+            local merged = {}
+            for k, v in pairs(old or {}) do merged[k] = v end
+            for k, v in pairs(new or {}) do
+                if not merged[k] or v > merged[k] then merged[k] = v end
+            end
+            return merged
+        end
+
+        local oldDay = existing.day or ""
+        local oldWeek = existing.week or ""
+
+        -- daily data: kills, loot
+        if inDay > oldDay then
+            -- newer day: replace daily data
+        elseif inDay == oldDay then
+            -- same day: merge max
+            newData.kills = mergeMax(existing.kills, newData.kills)
+            newData.loot = mergeMax(existing.loot, newData.loot)
+        else
+            -- older day: keep existing daily data
+            newData.kills = existing.kills
+            newData.loot = existing.loot
+            newData.day = oldDay
+        end
+
+        -- weekly data: weekKills, weekLoot, weekBadluck
+        if inWeek > oldWeek then
+            -- newer week: replace weekly data
+        elseif inWeek == oldWeek then
+            -- same week: merge max
+            newData.weekKills = mergeMax(existing.weekKills, newData.weekKills)
+            newData.weekLoot = mergeMax(existing.weekLoot, newData.weekLoot)
+            newData.weekBadluck = mergeMax(existing.weekBadluck, newData.weekBadluck)
+        else
+            -- older week: keep existing weekly data
+            newData.weekKills = existing.weekKills
+            newData.weekLoot = existing.weekLoot
+            newData.weekBadluck = existing.weekBadluck
+            newData.week = oldWeek
+        end
+
+        -- badluck (total/best) always merge max
+        newData.badluck = mergeMax(existing.badluck, newData.badluck)
+    end
+
+    guildData[btag] = newData
 
     return btag
 end
@@ -203,7 +263,7 @@ local function guildEncodeRelay()
     for btag, data in pairs(guildData) do
         if btag ~= myBtag then
             local parts = {}
-            parts[1] = btag .. "~" .. (data.name or "?")
+            parts[1] = btag .. "~" .. (data.name or "?") .. "~" .. (data.day or today()) .. "~" .. (data.week or thisWeek())
 
             local killParts = {}
             for k, v in pairs(data.kills or {}) do killParts[#killParts+1] = k .. "=" .. v end
@@ -258,6 +318,7 @@ local function requestGuildSync()
     guildDecode(guildEncode())
     C_ChatInfo.SendAddonMessage(GUILD_PREFIX, "REQ", "GUILD")
     sendGuildData()
+    sendGuildRelay()
     return true
 end
 
@@ -394,12 +455,15 @@ local function showStreakLogin()
 end
 
 local PATCH_NOTES = {
-    ["1.05.2"] = {
+    ["1.06"] = {
         "What's New in Cebulator!",
         " ",
-        "v1.05.2",
-        "- Fixed report, calendar and guild windows opening multiple times",
-        "  - they now toggle properly on repeated clicks",
+        "v1.06",
+        "- Improved kill detection via combat log + loot check",
+        "- Kills limited to once per beast per day per character",
+        "- Guild sync data saved between sessions",
+        "- Day/week timestamps prevent stale sync overwrites",
+        "- Bad Luck ranking: 3-column layout, top 10 entries",
         " ",
         "Check |cffffff00'/cebulator help'|r for detailed commands.",
     },
@@ -1001,15 +1065,17 @@ showGuild = function()
     end
     if guildFrame then guildFrame:Hide() end
 
-    local W = 620
+    local W = 660
     local PAD_TOP = 70
     local PAD_BOTTOM = 76
     local COL_W = (W - 52) / 2
+    local BL_COL_W = (W - 52) / 3
     local MAX_RANK = 5
+    local BL_MAX_RANK = 10
 
     local function rankColor(i)
         if i == 1 then return "|cffFFD700"
-        elseif i == 2 then return "|cffc0c0c0"
+        elseif i == 2 then return "|cffE0E0E0"
         elseif i == 3 then return "|cffcd7f32"
         else return "|cffaaaaaa" end
     end
@@ -1039,16 +1105,6 @@ showGuild = function()
         local rank = {}
         for btag, data in pairs(guildData) do
             local cur = (data.badluck or {})[tostring(itemId)] or 0
-            if cur > 0 then rank[#rank+1] = { name = data.name or btag, count = cur } end
-        end
-        table.sort(rank, function(a, b) return a.count > b.count end)
-        return rank
-    end
-
-    local function buildRankWeekBadLuck(itemId)
-        local rank = {}
-        for btag, data in pairs(guildData) do
-            local cur = (data.weekBadluck or {})[tostring(itemId)] or 0
             if cur > 0 then rank[#rank+1] = { name = data.name or btag, count = cur } end
         end
         table.sort(rank, function(a, b) return a.count > b.count end)
@@ -1108,15 +1164,16 @@ showGuild = function()
             return fs, fs:GetStringHeight()
         end
 
-        local function drawRankEntries(parent, x, y, rank, maxEntries, formatFn)
+        local function drawRankEntries(parent, x, y, rank, maxEntries, formatFn, colWidth)
+            local w = colWidth or COL_W
             local h = 0
             if #rank == 0 then
-                local _, lh = makeLabel(parent, x, y, "  |cffaaaaaano data yet|r", "GameFontHighlightSmall", COL_W)
+                local _, lh = makeLabel(parent, x, y, "  |cffaaaaaano data yet|r", "GameFontHighlightSmall", w)
                 return lh + 2
             end
             for i = 1, math.min(#rank, maxEntries) do
                 local text = formatFn(i, rank[i])
-                local _, lh = makeLabel(parent, x, y - h, text, "GameFontHighlightSmall", COL_W)
+                local _, lh = makeLabel(parent, x, y - h, text, "GameFontHighlightSmall", w)
                 h = h + lh + 2
             end
             return h
@@ -1191,13 +1248,13 @@ showGuild = function()
             h = drawRankEntries(content, leftX, leftY, dailyItemRank, MAX_RANK, function(i, e)
                 return string.format("    %s%d. %s|r - %s%d|r", rankColor(i), i, e.name, rankColor(i), e.count)
             end)
-            leftY = leftY - h - 4
+            leftY = leftY - h - 8
 
             local weeklyItemRank = buildRankLootItem("weekLoot", itemId)
             h = drawRankEntries(content, rightX, rightY, weeklyItemRank, MAX_RANK, function(i, e)
                 return string.format("    %s%d. %s|r - %s%d|r", rankColor(i), i, e.name, rankColor(i), e.count)
             end)
-            rightY = rightY - h - 4
+            rightY = rightY - h - 8
         end
 
         -- columns divider line (vertical)
@@ -1212,46 +1269,43 @@ showGuild = function()
 
         -- === BOTTOM: BAD LUCK ===
         local bottomY = colBottom - 18
-        _, lh = makeLabel(content, leftX, bottomY, "|cffffff00Guild Bad Luck Ranking|r", "GameFontNormalHuge", fullW)
+        _, lh = makeLabel(content, leftX, bottomY, "|cffffff00Longest Streak Without Drop|r", "GameFontNormalHuge", fullW)
         bottomY = bottomY - lh - 4
         drawHLine(content, leftX, bottomY, fullW)
         bottomY = bottomY - 6
 
-        -- two-column headers: Total | Weekly
-        _, lh = makeLabel(content, leftX, bottomY, "|cffffff00Total|r", "GameFontNormal", COL_W)
-        makeLabel(content, rightX, bottomY, "|cffffff00Weekly|r", "GameFontNormal", COL_W)
-        bottomY = bottomY - lh - 4
-
-        local blLeftY = bottomY
-        local blRightY = bottomY
-
+        -- 3-column layout: one per item
+        local blColX = {}
+        local blColY = {}
+        local itemList = {}
+        local idx = 0
         for itemId, itemName in pairs(ITEMS) do
-            _, lh = makeLabel(content, leftX, blLeftY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
-            makeLabel(content, rightX, blRightY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
-            blLeftY = blLeftY - lh - 2
-            blRightY = blRightY - lh - 2
-
-            local blRank = buildRankBadLuck(itemId)
-            h = drawRankEntries(content, leftX, blLeftY, blRank, MAX_RANK, function(i, e)
-                local color = i == 1 and "|cffcc4444" or "|cffaaaaaa"
-                return string.format("    %s%d. %s|r - %s%d|r kills w/o drop", color, i, e.name, color, e.count)
-            end)
-            blLeftY = blLeftY - h - 4
-
-            local wblRank = buildRankWeekBadLuck(itemId)
-            h = drawRankEntries(content, rightX, blRightY, wblRank, MAX_RANK, function(i, e)
-                local color = i == 1 and "|cffcc4444" or "|cffaaaaaa"
-                return string.format("    %s%d. %s|r - %s%d|r kills w/o drop", color, i, e.name, color, e.count)
-            end)
-            blRightY = blRightY - h - 4
+            idx = idx + 1
+            itemList[idx] = { id = itemId, name = itemName }
+            blColX[idx] = leftX + (idx - 1) * BL_COL_W
+            blColY[idx] = bottomY
         end
 
-        -- vertical divider for bad luck section
-        local blBottom = math.min(blLeftY, blRightY)
-        local blDivider = content:CreateTexture(nil, "ARTWORK")
-        blDivider:SetColorTexture(0.4, 0.4, 0.4, 0.5)
-        blDivider:SetSize(1, math.abs(blBottom - bottomY) + 4)
-        blDivider:SetPoint("TOPLEFT", content, "TOPLEFT", COL_W + 5, bottomY + 2)
+        for c = 1, #itemList do
+            _, lh = makeLabel(content, blColX[c], blColY[c], "|cffFFD700" .. itemList[c].name .. "|r", "GameFontNormal", BL_COL_W)
+            blColY[c] = blColY[c] - lh - 2
+            local blRank = buildRankBadLuck(itemList[c].id)
+            local blFmt = function(i, e)
+                local color = i == 1 and "|cffcc4444" or "|cffaaaaaa"
+                return string.format("  %s%d. %s|r - %s%d|r", color, i, e.name, color, e.count)
+            end
+            h = drawRankEntries(content, blColX[c], blColY[c], blRank, BL_MAX_RANK, blFmt, BL_COL_W)
+            blColY[c] = blColY[c] - h - 4
+        end
+
+        -- vertical dividers between bad luck columns
+        local blBottom = math.min(blColY[1], blColY[2], blColY[3])
+        for c = 1, 2 do
+            local blDiv = content:CreateTexture(nil, "ARTWORK")
+            blDiv:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+            blDiv:SetSize(1, math.abs(blBottom - bottomY) + 4)
+            blDiv:SetPoint("TOPLEFT", content, "TOPLEFT", blColX[c] + BL_COL_W - 2, bottomY + 2)
+        end
 
         local totalH = math.abs(blBottom)
         content:SetSize(fullW, totalH)
@@ -1513,8 +1567,8 @@ function Cebulator_OnCombatLog(msg)
     if not msg then return end
     for mobName in pairs(TRACKED_MOBS) do
         if msg:find(mobName, 1, true) then
-            getMobData(mobName).killed = true
             lastKilledMob = mobName
+            pendingKills[mobName] = true
         end
     end
 end
@@ -1580,6 +1634,7 @@ frame:SetScript("OnEvent", function(self, event, arg1, ...)
                 guildDecode(guildEncode())
                 C_ChatInfo.SendAddonMessage(GUILD_PREFIX, "REQ", "GUILD")
                 sendGuildData()
+                sendGuildRelay()
             end
         end)
     elseif event == "ZONE_CHANGED_NEW_AREA" then
@@ -1613,26 +1668,38 @@ frame:SetScript("OnEvent", function(self, event, arg1, ...)
             end
         end
     elseif event == "LOOT_OPENED" then
+        -- identify mob: prefer target, fallback to any pending beast kill
+        local mobName = nil
         local targetName = UnitName("target")
         if targetName and TRACKED_MOBS[targetName] then
-            local guid = GetLootSourceInfo(1)
-            getMobData(targetName).killed = true
-            local dayAccount = CebulatorDB[today()]
-            if not dayAccount[targetName] then dayAccount[targetName] = {} end
-            dayAccount[targetName].killed = true
-            lastKilledMob = targetName
-            if guid ~= lastLootedGUID then
-                lastLootedGUID = guid
-                lastLootedMob = targetName
-                onMobKilledForBadLuck(targetName)
+            mobName = targetName
+        else
+            for pending in pairs(pendingKills) do
+                if TRACKED_MOBS[pending] then
+                    mobName = pending
+                    break
+                end
+            end
+        end
+        if mobName then
+            pendingKills[mobName] = nil
+            lastKilledMob = mobName
+            -- only count once per mob per day per character
+            local charDay = getMobData(mobName)
+            if not charDay.killed then
+                charDay.killed = true
+                local dayAccount = CebulatorDB[today()]
+                if not dayAccount[mobName] then dayAccount[mobName] = {} end
+                dayAccount[mobName].killed = true
                 CebulatorDB.kills = CebulatorDB.kills + 1
                 local dk = CebulatorDB.dailyKills
                 local d = today()
                 if not dk[d] then dk[d] = {} end
-                dk[d][targetName] = (dk[d][targetName] or 0) + 1
+                dk[d][mobName] = (dk[d][mobName] or 0) + 1
+                onMobKilledForBadLuck(mobName)
                 onMobKilled()
             end
-            if targetName == "Umbrafang" then waypointSet = false end
+            if mobName == "Umbrafang" then waypointSet = false end
             -- check if all mobs in this zone are killed
             local zone = getZone()
             local zoneData = MOBS[zone]
@@ -1654,9 +1721,13 @@ frame:SetScript("OnEvent", function(self, event, arg1, ...)
         if prefix ~= GUILD_PREFIX then return end
         local msg2, channel, sender = ...
         if not msg2 then return end
+        -- ignore own messages
+        local myName = UnitName("player")
+        local myRealm = GetNormalizedRealmName() or ""
+        local fullName = myName .. "-" .. myRealm
+        if sender == myName or sender == fullName then return end
         if msg2 == "REQ" then
             sendGuildData()
-            -- relay cached data from other players
             sendGuildRelay()
         elseif msg2:sub(1, 4) == "DATA" then
             guildDecode(msg2)
