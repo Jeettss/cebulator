@@ -568,6 +568,7 @@ local function showReport()
         CebulatorReportFrame:Hide()
         return
     end
+    if CebulatorReportFrame then CebulatorReportFrame:Hide(); CebulatorReportFrame:SetParent(nil) end
 
     local W = 500
     local PAD_TOP = 70
@@ -775,6 +776,7 @@ showCalendar = function(anchorFrame)
         CebulatorCalendarFrame:Hide()
         return
     end
+    if CebulatorCalendarFrame then CebulatorCalendarFrame:Hide(); CebulatorCalendarFrame:SetParent(nil) end
 
     local utc     = time() + 2*3600
     local shifted = utc - 6*3600
@@ -1016,6 +1018,7 @@ showGuild = function()
         CebulatorGuildFrame:Hide()
         return
     end
+    if CebulatorGuildFrame then CebulatorGuildFrame:Hide(); CebulatorGuildFrame:SetParent(nil) end
 
     local W = 620
     local PAD_TOP = 70
