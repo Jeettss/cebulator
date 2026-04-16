@@ -37,17 +37,19 @@ local lastLootedMob = nil
 local lastLootedGUID = nil
 local coinBtn
 local waypointSet = false
+local showCalendar
+local showGuild
 
 local function today()
-    local utc     = time() + 2 * 3600
-    local shifted = utc - 6 * 3600
+    local cest    = time() + 2 * 3600
+    local shifted = cest - 6 * 3600
     local t       = date("*t", shifted)
     return string.format("%04d-%02d-%02d", t.year, t.month, t.day)
 end
 
 local function thisWeek()
-    local utc     = time() + 2 * 3600
-    local shifted = utc - 6 * 3600
+    local cest    = time() + 2 * 3600
+    local shifted = cest - 6 * 3600
     local t       = date("*t", shifted)
     -- weekday: 1=Sunday, 4=Wednesday
     local dow = t.wday
@@ -55,6 +57,207 @@ local function thisWeek()
     local weekStart = shifted - daysFromWed * 86400
     local ws = date("*t", weekStart)
     return string.format("%04d-W%02d-%02d-%02d", ws.year, ws.month, ws.day, t.wday >= 4 and 0 or 1)
+end
+
+-- ===== GUILD SYNC SYSTEM =====
+local GUILD_PREFIX = "Cebulator"
+local guildData = {}  -- guildData[btag] = { name=charName, kills={}, loot={}, badluck={}, weekBadluck={}, weekKills={}, weekLoot={} }
+local lastGuildSync = 0
+local GUILD_SYNC_COOLDOWN = 60
+
+local function getPlayerBTag()
+    local ok, _, tag = pcall(BNGetInfo)
+    if ok and tag and type(tag) == "string" then
+        return tag:match("^([^#]+)") or tag
+    end
+    return UnitName("player") or "Unknown"
+end
+
+local function guildEncode()
+    local d = today()
+    local w = thisWeek()
+    local btag = getPlayerBTag()
+    local charName = UnitName("player")
+    local parts = {}
+
+    -- part 0: btag~charName
+    parts[1] = btag .. "~" .. charName
+
+    local dk = CebulatorDB.dailyKills[d]
+    local killParts = {}
+    if dk then
+        for mob, cnt in pairs(dk) do
+            killParts[#killParts+1] = mob .. "=" .. cnt
+        end
+    end
+    parts[2] = table.concat(killParts, ",")
+
+    local dl = CebulatorDB[d]
+    local lootParts = {}
+    if dl then
+        for itemId in pairs(ITEMS) do
+            if (dl[itemId] or 0) > 0 then
+                lootParts[#lootParts+1] = itemId .. "=" .. dl[itemId]
+            end
+        end
+    end
+    parts[3] = table.concat(lootParts, ",")
+
+    local bl = CebulatorDB.badluck
+    local blParts = {}
+    for itemId in pairs(ITEMS) do
+        local cur = bl.current[itemId] or 0
+        if cur > 0 then
+            blParts[#blParts+1] = itemId .. "=" .. cur
+        end
+    end
+    parts[4] = table.concat(blParts, ",")
+
+    -- weekly kills
+    local wk = {}
+    local cestNow = time() + 2 * 3600
+    local shiftedNow = cestNow - 6 * 3600
+    local tNow = date("*t", shiftedNow)
+    local dowNow = tNow.wday
+    local daysFromWedNow = (dowNow - 4 + 7) % 7
+    local weekStartSec = shiftedNow - daysFromWedNow * 86400
+    local wsDate = date("*t", weekStartSec)
+    local weekStartStr = string.format("%04d-%02d-%02d", wsDate.year, wsDate.month, wsDate.day)
+    for dateStr, mobs in pairs(CebulatorDB.dailyKills) do
+        if dateStr >= weekStartStr and dateStr <= d then
+            for mob, cnt in pairs(mobs) do
+                wk[mob] = (wk[mob] or 0) + cnt
+            end
+        end
+    end
+    local wkParts = {}
+    for mob, cnt in pairs(wk) do
+        wkParts[#wkParts+1] = mob .. "=" .. cnt
+    end
+    parts[5] = table.concat(wkParts, ",")
+
+    -- weekly loot
+    local wr = CebulatorDB.records and CebulatorDB.records.weekly and CebulatorDB.records.weekly[w]
+    local wlParts = {}
+    if wr then
+        for itemId in pairs(ITEMS) do
+            if (wr[itemId] or 0) > 0 then
+                wlParts[#wlParts+1] = itemId .. "=" .. wr[itemId]
+            end
+        end
+    end
+    parts[6] = table.concat(wlParts, ",")
+
+    -- weekly bad luck
+    local wblParts = {}
+    local wbl = CebulatorDB.badluck.weekCurrent
+    for itemId in pairs(ITEMS) do
+        local cur = wbl[itemId] or 0
+        if cur > 0 then
+            wblParts[#wblParts+1] = itemId .. "=" .. cur
+        end
+    end
+    parts[7] = table.concat(wblParts, ",")
+
+    return "DATA|" .. table.concat(parts, "|")
+end
+
+local function guildDecode(payload)
+    local segments = { strsplit("|", payload) }
+    local tag = segments[1]
+    if tag ~= "DATA" then return end
+
+    local function parseKV(str)
+        local t = {}
+        if str and str ~= "" then
+            for pair in str:gmatch("[^,]+") do
+                local k, v = pair:match("(.+)=(%d+)")
+                if k and v then t[k] = tonumber(v) end
+            end
+        end
+        return t
+    end
+
+    local identStr = segments[2] or ""
+    local btag, charName = identStr:match("^(.+)~(.+)$")
+    if not btag then return end
+
+    guildData[btag] = {
+        name = charName,
+        kills = parseKV(segments[3] or ""),
+        loot = parseKV(segments[4] or ""),
+        badluck = parseKV(segments[5] or ""),
+        weekKills = parseKV(segments[6] or ""),
+        weekLoot = parseKV(segments[7] or ""),
+        weekBadluck = parseKV(segments[8] or ""),
+    }
+
+    return btag
+end
+
+local function guildEncodeRelay()
+    -- encode all cached guildData entries as RELAY messages
+    local msgs = {}
+    local myBtag = getPlayerBTag()
+    for btag, data in pairs(guildData) do
+        if btag ~= myBtag then
+            local parts = {}
+            parts[1] = btag .. "~" .. (data.name or "?")
+
+            local killParts = {}
+            for k, v in pairs(data.kills or {}) do killParts[#killParts+1] = k .. "=" .. v end
+            parts[2] = table.concat(killParts, ",")
+
+            local lootParts = {}
+            for k, v in pairs(data.loot or {}) do lootParts[#lootParts+1] = k .. "=" .. v end
+            parts[3] = table.concat(lootParts, ",")
+
+            local blParts = {}
+            for k, v in pairs(data.badluck or {}) do blParts[#blParts+1] = k .. "=" .. v end
+            parts[4] = table.concat(blParts, ",")
+
+            local wkParts = {}
+            for k, v in pairs(data.weekKills or {}) do wkParts[#wkParts+1] = k .. "=" .. v end
+            parts[5] = table.concat(wkParts, ",")
+
+            local wlParts = {}
+            for k, v in pairs(data.weekLoot or {}) do wlParts[#wlParts+1] = k .. "=" .. v end
+            parts[6] = table.concat(wlParts, ",")
+
+            local wblParts = {}
+            for k, v in pairs(data.weekBadluck or {}) do wblParts[#wblParts+1] = k .. "=" .. v end
+            parts[7] = table.concat(wblParts, ",")
+
+            msgs[#msgs+1] = "DATA|" .. table.concat(parts, "|")
+        end
+    end
+    return msgs
+end
+
+local function sendGuildData()
+    if not IsInGuild() then return end
+    local msg = guildEncode()
+    C_ChatInfo.SendAddonMessage(GUILD_PREFIX, msg, "GUILD")
+end
+
+local function sendGuildRelay()
+    if not IsInGuild() then return end
+    local msgs = guildEncodeRelay()
+    for _, msg in ipairs(msgs) do
+        C_ChatInfo.SendAddonMessage(GUILD_PREFIX, msg, "GUILD")
+    end
+end
+
+local function requestGuildSync()
+    if not IsInGuild() then return end
+    local now = time()
+    if now - lastGuildSync < GUILD_SYNC_COOLDOWN then return false end
+    lastGuildSync = now
+    -- include own data
+    guildDecode(guildEncode())
+    C_ChatInfo.SendAddonMessage(GUILD_PREFIX, "REQ", "GUILD")
+    sendGuildData()
+    return true
 end
 
 local function initDB()
@@ -69,24 +272,36 @@ local function initDB()
         CebulatorDB.streak = { current = 0, best = 0, lastKillDay = nil }
     end
     if not CebulatorDB.kills then CebulatorDB.kills = 0 end
+    if not CebulatorDB.dailyKills then CebulatorDB.dailyKills = {} end
     if not CebulatorDB.lastSeenVersion then CebulatorDB.lastSeenVersion = "" end
     if CebulatorDB.reportPos == nil then CebulatorDB.reportPos = false end
     if not CebulatorDB.records then
         CebulatorDB.records = { daily = {}, weekly = {} }
     end
     if not CebulatorDB.badluck then
-        CebulatorDB.badluck = { current = {}, best = {} }
+        CebulatorDB.badluck = { current = {}, best = {}, weekCurrent = {}, weekKey = thisWeek() }
         for itemId in pairs(ITEMS) do
             CebulatorDB.badluck.current[itemId] = 0
             CebulatorDB.badluck.best[itemId]    = 0
+            CebulatorDB.badluck.weekCurrent[itemId] = 0
         end
     end
-    -- inicjalizuj brakujące klucze w badluck
+    -- initialize missing badluck keys
+    if not CebulatorDB.badluck.weekCurrent then CebulatorDB.badluck.weekCurrent = {} end
+    if not CebulatorDB.badluck.weekKey then CebulatorDB.badluck.weekKey = thisWeek() end
     for itemId in pairs(ITEMS) do
         if not CebulatorDB.badluck.current[itemId] then CebulatorDB.badluck.current[itemId] = 0 end
         if not CebulatorDB.badluck.best[itemId]    then CebulatorDB.badluck.best[itemId]    = 0 end
+        if not CebulatorDB.badluck.weekCurrent[itemId] then CebulatorDB.badluck.weekCurrent[itemId] = 0 end
     end
-    -- inicjalizuj rekordy tygodniowe/dzienne
+    -- reset weekly bad luck on new week
+    if CebulatorDB.badluck.weekKey ~= thisWeek() then
+        CebulatorDB.badluck.weekKey = thisWeek()
+        for itemId in pairs(ITEMS) do
+            CebulatorDB.badluck.weekCurrent[itemId] = 0
+        end
+    end
+    -- initialize daily/weekly records
     if not CebulatorDB.records.daily[today()]      then CebulatorDB.records.daily[today()]      = {} end
     if not CebulatorDB.records.weekly[thisWeek()]  then CebulatorDB.records.weekly[thisWeek()]  = {} end
     if not CebulatorCharDB then CebulatorCharDB = {} end
@@ -130,10 +345,10 @@ local function updateStreak()
     local s = CebulatorDB.streak
     local t = today()
     if s.lastKillDay == nil then return end
-    -- sprawdź czy poprzedni dzień był wczoraj lub dziś
+    -- check if last kill day was yesterday or today
     local lastTime = s.lastKillDay
     local todayTime = t
-    -- jeśli lastKillDay to nie dziś i nie wczoraj - reset
+    -- if lastKillDay is neither today nor yesterday - reset
     local function daysBetween(d1, d2)
         local function toSec(d)
             local y, m, day = d:match("(%d+)-(%d+)-(%d+)")
@@ -151,7 +366,7 @@ end
 local function onMobKilled()
     local s = CebulatorDB.streak
     local t = today()
-    if s.lastKillDay == t then return end  -- już dziś przedłużono
+    if s.lastKillDay == t then return end  -- already extended today
     s.lastKillDay = t
     s.current = s.current + 1
     if s.current > s.best then s.best = s.current end
@@ -176,6 +391,24 @@ local function showStreakLogin()
 end
 
 local PATCH_NOTES = {
+    ["1.05"] = {
+        "What's New in Cebulator!",
+        " ",
+        "v1.05",
+        "- Guild Rankings tab (experimental) - see daily and weekly kill/loot rankings",
+        "  from guild members who use Cebulator",
+        "- Guild Bad Luck ranking - total and weekly dry streaks per item",
+        "- Two-column layout in Guild tab - Daily on the left, Weekly on the right",
+        "- Sync with guild button - request fresh data from online guildies (60s cooldown)",
+        "- Auto guild sync on login - data is exchanged automatically",
+        "- Data relay - offline players' data is forwarded by online members",
+        "- BattleTag deduplication - multiple characters on the same account",
+        "  show as one entry in rankings",
+        "- Bottom navigation menu - Summary, Calendar and Guild tabs",
+        "  are now at the bottom of each window",
+        " ",
+        "Check |cffffff00'/cebulator help'|r for detailed commands.",
+    },
     ["1.04"] = {
         "What's New in Cebulator!",
         " ",
@@ -289,7 +522,7 @@ local function onItemLooted(itemId, count)
     if not r.weekly[w]  then r.weekly[w]  = {} end
     r.daily[d][itemId]  = (r.daily[d][itemId]  or 0) + count
     r.weekly[w][itemId] = (r.weekly[w][itemId] or 0) + count
-    -- sprawdź rekord dzienny
+    -- check daily record
     local bestDay = 0
     for _, dayData in pairs(r.daily) do
         if (dayData[itemId] or 0) > bestDay then bestDay = dayData[itemId] end
@@ -305,6 +538,7 @@ local function onItemLooted(itemId, count)
     end
     -- reset bad luck
     CebulatorDB.badluck.current[itemId] = 0
+    CebulatorDB.badluck.weekCurrent[itemId] = 0
 end
 
 local function onMobKilledForBadLuck(mobName)
@@ -316,6 +550,7 @@ local function onMobKilledForBadLuck(mobName)
         if bl.current[itemId] > (bl.best[itemId] or 0) then
             bl.best[itemId] = bl.current[itemId]
         end
+        bl.weekCurrent[itemId] = (bl.weekCurrent[itemId] or 0) + 1
     end
 end
 
@@ -336,7 +571,7 @@ local function showReport()
 
     local W = 500
     local PAD_TOP = 70
-    local PAD_BOTTOM = 50
+    local PAD_BOTTOM = 76
     local contentW = W - 52
 
     local lines = {}
@@ -345,7 +580,7 @@ local function showReport()
     end
 
     local s = CebulatorDB.streak
-    addLine(string.format("|cffFFD700Killing Streak: %d day%s|r  |cff00cc00(best: %d)|r",
+    addLine(string.format("|cffFFD700Account Killing Streak: %d day%s|r  |cff00cc00(best: %d)|r",
         s.current, s.current == 1 and "" or "s", s.best), "GameFontNormal")
     addLine(" ")
 
@@ -446,7 +681,7 @@ local function showReport()
     subtitle:SetText("v" .. version .. " - Summary")
 
     local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    hint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 20, 46)
+    hint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 20, 62)
     hint:SetText("|cffaaaaaaCheck |cffffff00/cebulator help|r|cffaaaaaa for additional commands.|r")
 
     local fontStrings = {}
@@ -477,6 +712,606 @@ local function showReport()
         end
         lastLine = fs
     end
+
+    -- bottom menu
+    local guildBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    guildBtn:SetSize(100, 22)
+    guildBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -120, 36)
+    guildBtn:SetText("Guild")
+    guildBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+        showGuild()
+    end)
+
+    local calBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    calBtn:SetSize(100, 22)
+    calBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -16, 36)
+    calBtn:SetText("Calendar")
+    calBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+        showCalendar()
+    end)
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    closeBtn:SetSize(80, 22)
+    closeBtn:SetPoint("BOTTOM", f, "BOTTOM", 0, 10)
+    closeBtn:SetText("Close")
+    closeBtn:SetScript("OnClick", function()
+        local point, _, _, x, y = f:GetPoint()
+        CebulatorDB.reportPos = { point = point, x = x, y = y }
+        f:Hide()
+    end)
+
+    local pos = CebulatorDB.reportPos
+    if pos then
+        f:SetPoint(pos.point, UIParent, pos.point, pos.x, pos.y)
+    else
+        f:SetPoint("CENTER")
+    end
+
+    f:Show()
+end
+
+local MONTH_NAMES = { "January","February","March","April","May","June","July","August","September","October","November","December" }
+local DAY_NAMES   = { "Mon","Tue","Wed","Thu","Fri","Sat","Sun" }
+
+local function daysInMonth(y, m)
+    if m == 2 then return (y%4==0 and (y%100~=0 or y%400==0)) and 29 or 28 end
+    if m==4 or m==6 or m==9 or m==11 then return 30 end
+    return 31
+end
+
+local function firstWeekday(y, m) -- 1=Mon..7=Sun
+    local t = date("*t", time({year=y,month=m,day=1,hour=12}))
+    return t.wday == 1 and 7 or t.wday - 1
+end
+
+showCalendar = function(anchorFrame)
+    if CebulatorCalendarFrame and CebulatorCalendarFrame:IsShown() then
+        CebulatorCalendarFrame:Hide()
+        return
+    end
+
+    local utc     = time() + 2*3600
+    local shifted = utc - 6*3600
+    local tnow    = date("*t", shifted)
+    local curYear, curMonth = tnow.year, tnow.month
+    local todayStr = today()
+
+    local CELL = 52
+    local COLS = 7
+    local W    = CELL * COLS + 40
+    local calViewYear, calViewMonth = curYear, curMonth
+
+    local f = CreateFrame("Frame", "CebulatorCalendarFrame", UIParent, "BackdropTemplate")
+    f:SetFrameStrata("DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local point,_,_,x,y = self:GetPoint()
+        CebulatorDB.reportPos = { point=point, x=x, y=y }
+    end)
+    f:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile=true, tileSize=32, edgeSize=32,
+        insets={left=11,right=12,top=12,bottom=11},
+    })
+
+    -- header icon + title
+    local icon = f:CreateTexture(nil,"ARTWORK")
+    icon:SetTexture("Interface\\AddOns\\Cebulator\\cebulator")
+    icon:SetSize(40,40)
+    icon:SetPoint("TOPLEFT",f,"TOPLEFT",18,-16)
+    local iconMask = f:CreateMaskTexture()
+    iconMask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+    iconMask:SetAllPoints(icon)
+    icon:AddMaskTexture(iconMask)
+    local titleFs = f:CreateFontString(nil,"OVERLAY","GameFontNormalLarge")
+    titleFs:SetPoint("TOPLEFT",icon,"TOPRIGHT",10,0)
+    titleFs:SetText("|cffffff00Cebulator|r")
+    local subtitleFs = f:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    subtitleFs:SetPoint("TOPLEFT",titleFs,"BOTTOMLEFT",0,-2)
+    subtitleFs:SetText("Calendar")
+
+    -- month nav
+    local monthLabel = f:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    monthLabel:SetPoint("TOP",f,"TOP",0,-68)
+
+    local prevBtn = CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    prevBtn:SetSize(24,22)
+    prevBtn:SetPoint("RIGHT",monthLabel,"LEFT",-6,0)
+    prevBtn:SetText("<")
+
+    local nextBtn = CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    nextBtn:SetSize(24,22)
+    nextBtn:SetPoint("LEFT",monthLabel,"RIGHT",6,0)
+    nextBtn:SetText(">")
+
+    -- day headers
+    local headerY = -95
+    for i,dn in ipairs(DAY_NAMES) do
+        local fs = f:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+        fs:SetSize(CELL,16)
+        fs:SetPoint("TOPLEFT",f,"TOPLEFT", 20+(i-1)*CELL, headerY)
+        fs:SetJustifyH("CENTER")
+        fs:SetText("|cffaaaaaa"..dn.."|r")
+    end
+
+    -- cell pool
+    local cells = {}
+    for row=0,5 do
+        for col=0,6 do
+            local btn = CreateFrame("Button",nil,f)
+            btn:SetSize(CELL-2, CELL-2)
+            btn:SetPoint("TOPLEFT",f,"TOPLEFT", 20+col*CELL, headerY-20-row*(CELL))
+            local bg = btn:CreateTexture(nil,"BACKGROUND")
+            bg:SetAllPoints()
+            btn.bg = bg
+            local numFs = btn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+            numFs:SetPoint("TOPLEFT",btn,"TOPLEFT",4,-2)
+            btn.numFs = numFs
+            local killFs = btn:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+            killFs:SetPoint("CENTER",btn,"CENTER",0,-4)
+            btn.killFs = killFs
+            btn:SetScript("OnEnter", function(self)
+                if not self.dateStr then return end
+                local dk = CebulatorDB.dailyKills[self.dateStr]
+                local dl = CebulatorDB[self.dateStr]
+                if not dk and not dl then return end
+                GameTooltip:SetOwner(self,"ANCHOR_RIGHT")
+                GameTooltip:AddLine("|cffffff00"..self.dateStr.."|r")
+                GameTooltip:AddLine(" ")
+                if dk then
+                    GameTooltip:AddLine("|cffaaaaaa-- Kills --|r")
+                    for mob,cnt in pairs(dk) do
+                        GameTooltip:AddLine(string.format("  %s: %d", mob, cnt))
+                    end
+                end
+                if dl then
+                    local hasLoot = false
+                    for itemId,itemName in pairs(ITEMS) do
+                        if (dl[itemId] or 0) > 0 then hasLoot = true end
+                    end
+                    if hasLoot then
+                        GameTooltip:AddLine(" ")
+                        GameTooltip:AddLine("|cffaaaaaa-- Loot --|r")
+                        for itemId,itemName in pairs(ITEMS) do
+                            local cnt = dl[itemId] or 0
+                            if cnt > 0 then
+                                GameTooltip:AddLine(string.format("  %s: %d", itemName, cnt))
+                            end
+                        end
+                    end
+                end
+                GameTooltip:Show()
+            end)
+            btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            cells[row*7+col+1] = btn
+        end
+    end
+
+    local function renderMonth()
+        local dim = daysInMonth(calViewYear, calViewMonth)
+        local startWd = firstWeekday(calViewYear, calViewMonth)
+        monthLabel:SetText(string.format("|cffffff00%s %d|r", MONTH_NAMES[calViewMonth], calViewYear))
+
+        -- disable nav beyond limits
+        local minYear, minMonth = curYear, curMonth - 3
+        if minMonth <= 0 then minYear = curYear-1; minMonth = minMonth+12 end
+        local maxYear, maxMonth = curYear, curMonth + 2
+        if maxMonth > 12 then maxYear = curYear+1; maxMonth = maxMonth-12 end
+        prevBtn:SetEnabled(not (calViewYear==minYear and calViewMonth==minMonth))
+        nextBtn:SetEnabled(not (calViewYear==maxYear and calViewMonth==maxMonth))
+
+        for i=1,42 do
+            local cell = cells[i]
+            local dayNum = i - startWd + 1
+            if dayNum < 1 or dayNum > dim then
+                cell:Hide()
+            else
+                cell:Show()
+                local ds = string.format("%04d-%02d-%02d", calViewYear, calViewMonth, dayNum)
+                cell.dateStr = ds
+                cell.numFs:SetText("|cffaaaaaa"..dayNum.."|r")
+
+                -- total kills that day
+                local dk = CebulatorDB.dailyKills[ds]
+                local totalKills = 0
+                if dk then for _,v in pairs(dk) do totalKills = totalKills + v end end
+
+                -- color gradient: 0=gray, 1-3=light green, 4-6=medium, 7+=bright
+                local r,g,b,a
+                if ds == todayStr then
+                    r,g,b,a = 0.2,0.2,0.5,0.6  -- today highlight blue
+                elseif totalKills == 0 then
+                    r,g,b,a = 0.15,0.15,0.15,0.8
+                elseif totalKills <= 3 then
+                    r,g,b,a = 0.1,0.3,0.1,0.9
+                elseif totalKills <= 6 then
+                    r,g,b,a = 0.1,0.5,0.1,0.9
+                else
+                    r,g,b,a = 0.1,0.75,0.1,0.9
+                end
+                cell.bg:SetColorTexture(r,g,b,a)
+
+                if totalKills > 0 then
+                    cell.killFs:SetText("|cff00ff00"..totalKills.."|r")
+                else
+                    cell.killFs:SetText("")
+                end
+            end
+        end
+
+        -- frame height based on rows needed
+        local rows = math.ceil((startWd - 1 + dim) / 7)
+        f:SetSize(W, 120 + 20 + rows * CELL + 76)
+    end
+
+    prevBtn:SetScript("OnClick", function()
+        calViewMonth = calViewMonth - 1
+        if calViewMonth < 1 then calViewMonth = 12; calViewYear = calViewYear - 1 end
+        renderMonth()
+    end)
+    nextBtn:SetScript("OnClick", function()
+        calViewMonth = calViewMonth + 1
+        if calViewMonth > 12 then calViewMonth = 1; calViewYear = calViewYear + 1 end
+        renderMonth()
+    end)
+
+
+    -- bottom menu
+    local guildBtn = CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    guildBtn:SetSize(100,22)
+    guildBtn:SetPoint("BOTTOMRIGHT",f,"BOTTOMRIGHT",-120,36)
+    guildBtn:SetText("Guild")
+    guildBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+        showGuild()
+    end)
+
+    local summaryBtn = CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    summaryBtn:SetSize(100,22)
+    summaryBtn:SetPoint("BOTTOMRIGHT",f,"BOTTOMRIGHT",-16,36)
+    summaryBtn:SetText("Summary")
+    summaryBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+        showReport()
+    end)
+
+    local closeBtn = CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    closeBtn:SetSize(80,22)
+    closeBtn:SetPoint("BOTTOM",f,"BOTTOM",0,10)
+    closeBtn:SetText("Close")
+    closeBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+    end)
+
+    local pos = CebulatorDB.reportPos
+    if pos then
+        f:SetPoint(pos.point, UIParent, pos.point, pos.x, pos.y)
+    else
+        f:SetPoint("CENTER")
+    end
+
+    renderMonth()
+    f:Show()
+end
+
+showGuild = function()
+    if CebulatorGuildFrame and CebulatorGuildFrame:IsShown() then
+        CebulatorGuildFrame:Hide()
+        return
+    end
+
+    local W = 620
+    local PAD_TOP = 70
+    local PAD_BOTTOM = 76
+    local COL_W = (W - 52) / 2
+    local MAX_RANK = 5
+
+    local function rankColor(i)
+        if i == 1 then return "|cffFFD700"
+        elseif i == 2 then return "|cffc0c0c0"
+        elseif i == 3 then return "|cffcd7f32"
+        else return "|cffaaaaaa" end
+    end
+
+    local function buildRankKills(dataKey)
+        local rank = {}
+        for btag, data in pairs(guildData) do
+            local total = 0
+            for _, cnt in pairs(data[dataKey] or {}) do total = total + cnt end
+            if total > 0 then rank[#rank+1] = { name = data.name or btag, count = total } end
+        end
+        table.sort(rank, function(a, b) return a.count > b.count end)
+        return rank
+    end
+
+    local function buildRankLootItem(dataKey, itemId)
+        local rank = {}
+        for btag, data in pairs(guildData) do
+            local cnt = (data[dataKey] or {})[tostring(itemId)] or 0
+            if cnt > 0 then rank[#rank+1] = { name = data.name or btag, count = cnt } end
+        end
+        table.sort(rank, function(a, b) return a.count > b.count end)
+        return rank
+    end
+
+    local function buildRankBadLuck(itemId)
+        local rank = {}
+        for btag, data in pairs(guildData) do
+            local cur = (data.badluck or {})[tostring(itemId)] or 0
+            if cur > 0 then rank[#rank+1] = { name = data.name or btag, count = cur } end
+        end
+        table.sort(rank, function(a, b) return a.count > b.count end)
+        return rank
+    end
+
+    local function buildRankWeekBadLuck(itemId)
+        local rank = {}
+        for btag, data in pairs(guildData) do
+            local cur = (data.weekBadluck or {})[tostring(itemId)] or 0
+            if cur > 0 then rank[#rank+1] = { name = data.name or btag, count = cur } end
+        end
+        table.sort(rank, function(a, b) return a.count > b.count end)
+        return rank
+    end
+
+    -- build frame
+    local f = CreateFrame("Frame", "CebulatorGuildFrame", UIParent, "BackdropTemplate")
+    f:SetFrameStrata("DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local point, _, _, x, y = self:GetPoint()
+        CebulatorDB.reportPos = { point = point, x = x, y = y }
+    end)
+    f:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 32,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    })
+
+    local icon = f:CreateTexture(nil, "ARTWORK")
+    icon:SetTexture("Interface\\AddOns\\Cebulator\\cebulator")
+    icon:SetSize(40, 40)
+    icon:SetPoint("TOPLEFT", f, "TOPLEFT", 18, -16)
+    local iconMask = f:CreateMaskTexture()
+    iconMask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask")
+    iconMask:SetAllPoints(icon)
+    icon:AddMaskTexture(iconMask)
+
+    local titleFs = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    titleFs:SetPoint("TOPLEFT", icon, "TOPRIGHT", 10, 0)
+    titleFs:SetText("|cffffff00Cebulator|r")
+    local subtitleFs = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    subtitleFs:SetPoint("TOPLEFT", titleFs, "BOTTOMLEFT", 0, -2)
+    subtitleFs:SetText("Guild")
+
+    if not IsInGuild() then
+        local noGuild = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        noGuild:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -PAD_TOP + 10)
+        noGuild:SetText("|cffcc4444Sorry, you have no guild.|r")
+        f:SetSize(W, PAD_TOP + 30 + PAD_BOTTOM)
+    else
+        guildDecode(guildEncode())
+
+        local function makeLabel(parent, x, y, text, font, width)
+            local fs = parent:CreateFontString(nil, "OVERLAY", font or "GameFontHighlight")
+            fs:SetWidth(width or COL_W)
+            fs:SetJustifyH("LEFT")
+            fs:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+            fs:SetText(text)
+            return fs, fs:GetStringHeight()
+        end
+
+        local function drawRankEntries(parent, x, y, rank, maxEntries, formatFn)
+            local h = 0
+            if #rank == 0 then
+                local _, lh = makeLabel(parent, x, y, "  |cffaaaaaano data yet|r", "GameFontHighlightSmall", COL_W)
+                return lh + 2
+            end
+            for i = 1, math.min(#rank, maxEntries) do
+                local text = formatFn(i, rank[i])
+                local _, lh = makeLabel(parent, x, y - h, text, "GameFontHighlightSmall", COL_W)
+                h = h + lh + 2
+            end
+            return h
+        end
+
+        local function drawHLine(parent, x, y, width)
+            local line = parent:CreateTexture(nil, "ARTWORK")
+            line:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+            line:SetSize(width, 1)
+            line:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+        end
+
+        local content = CreateFrame("Frame", nil, f)
+        content:SetPoint("TOPLEFT", f, "TOPLEFT", 20, -PAD_TOP + 10)
+
+        local leftX = 0
+        local rightX = COL_W + 10
+        local leftY = 0
+        local rightY = 0
+        local fullW = COL_W * 2 + 10
+
+        -- === BIG HEADERS ===
+        local _, lh = makeLabel(content, leftX, leftY, "|cffffff00Daily|r", "GameFontNormalHuge", COL_W)
+        makeLabel(content, rightX, rightY, "|cffffff00Weekly|r", "GameFontNormalHuge", COL_W)
+        leftY = leftY - lh - 6
+        rightY = rightY - lh - 6
+
+        -- horizontal line under headers
+        drawHLine(content, leftX, leftY, COL_W - 5)
+        drawHLine(content, rightX, rightY, COL_W - 5)
+        leftY = leftY - 6
+        rightY = rightY - 6
+
+        -- === RENOWNED BEAST KILLS ===
+        _, lh = makeLabel(content, leftX, leftY, "|cffffff00Renowned Beast Kills|r", "GameFontNormal", COL_W)
+        makeLabel(content, rightX, rightY, "|cffffff00Renowned Beast Kills|r", "GameFontNormal", COL_W)
+        leftY = leftY - lh - 4
+        rightY = rightY - lh - 4
+
+        local dailyKillRank = buildRankKills("kills")
+        local h = drawRankEntries(content, leftX, leftY, dailyKillRank, MAX_RANK, function(i, e)
+            return string.format("  %s%d. %s|r - |cff00ff00%d|r", rankColor(i), i, e.name, e.count)
+        end)
+        leftY = leftY - h - 6
+
+        local weeklyKillRank = buildRankKills("weekKills")
+        h = drawRankEntries(content, rightX, rightY, weeklyKillRank, MAX_RANK, function(i, e)
+            return string.format("  %s%d. %s|r - |cff00ff00%d|r", rankColor(i), i, e.name, e.count)
+        end)
+        rightY = rightY - h - 6
+
+        -- horizontal line between kills and loot
+        local killsBottom = math.min(leftY, rightY)
+        drawHLine(content, leftX, killsBottom, COL_W - 5)
+        drawHLine(content, rightX, killsBottom, COL_W - 5)
+        leftY = killsBottom - 6
+        rightY = killsBottom - 6
+
+        -- === LOOT AMOUNT ===
+        _, lh = makeLabel(content, leftX, leftY, "|cffffff00Loot Amount|r", "GameFontNormal", COL_W)
+        makeLabel(content, rightX, rightY, "|cffffff00Loot Amount|r", "GameFontNormal", COL_W)
+        leftY = leftY - lh - 4
+        rightY = rightY - lh - 4
+
+        for itemId, itemName in pairs(ITEMS) do
+            _, lh = makeLabel(content, leftX, leftY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
+            makeLabel(content, rightX, rightY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
+            leftY = leftY - lh - 2
+            rightY = rightY - lh - 2
+
+            local dailyItemRank = buildRankLootItem("loot", itemId)
+            h = drawRankEntries(content, leftX, leftY, dailyItemRank, MAX_RANK, function(i, e)
+                return string.format("    %s%d. %s|r - %s%d|r", rankColor(i), i, e.name, rankColor(i), e.count)
+            end)
+            leftY = leftY - h - 4
+
+            local weeklyItemRank = buildRankLootItem("weekLoot", itemId)
+            h = drawRankEntries(content, rightX, rightY, weeklyItemRank, MAX_RANK, function(i, e)
+                return string.format("    %s%d. %s|r - %s%d|r", rankColor(i), i, e.name, rankColor(i), e.count)
+            end)
+            rightY = rightY - h - 4
+        end
+
+        -- columns divider line (vertical)
+        local colBottom = math.min(leftY, rightY)
+        local divider = content:CreateTexture(nil, "ARTWORK")
+        divider:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+        divider:SetSize(1, math.abs(colBottom) + 4)
+        divider:SetPoint("TOPLEFT", content, "TOPLEFT", COL_W + 5, 2)
+
+        -- horizontal line before bad luck
+        drawHLine(content, leftX, colBottom - 6, fullW)
+
+        -- === BOTTOM: BAD LUCK ===
+        local bottomY = colBottom - 18
+        _, lh = makeLabel(content, leftX, bottomY, "|cffffff00Guild Bad Luck Ranking|r", "GameFontNormalHuge", fullW)
+        bottomY = bottomY - lh - 4
+        drawHLine(content, leftX, bottomY, fullW)
+        bottomY = bottomY - 6
+
+        -- two-column headers: Total | Weekly
+        _, lh = makeLabel(content, leftX, bottomY, "|cffffff00Total|r", "GameFontNormal", COL_W)
+        makeLabel(content, rightX, bottomY, "|cffffff00Weekly|r", "GameFontNormal", COL_W)
+        bottomY = bottomY - lh - 4
+
+        local blLeftY = bottomY
+        local blRightY = bottomY
+
+        for itemId, itemName in pairs(ITEMS) do
+            _, lh = makeLabel(content, leftX, blLeftY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
+            makeLabel(content, rightX, blRightY, "  |cffFFD700" .. itemName .. "|r:", "GameFontNormal", COL_W)
+            blLeftY = blLeftY - lh - 2
+            blRightY = blRightY - lh - 2
+
+            local blRank = buildRankBadLuck(itemId)
+            h = drawRankEntries(content, leftX, blLeftY, blRank, MAX_RANK, function(i, e)
+                local color = i == 1 and "|cffcc4444" or "|cffaaaaaa"
+                return string.format("    %s%d. %s|r - %s%d|r kills w/o drop", color, i, e.name, color, e.count)
+            end)
+            blLeftY = blLeftY - h - 4
+
+            local wblRank = buildRankWeekBadLuck(itemId)
+            h = drawRankEntries(content, rightX, blRightY, wblRank, MAX_RANK, function(i, e)
+                local color = i == 1 and "|cffcc4444" or "|cffaaaaaa"
+                return string.format("    %s%d. %s|r - %s%d|r kills w/o drop", color, i, e.name, color, e.count)
+            end)
+            blRightY = blRightY - h - 4
+        end
+
+        -- vertical divider for bad luck section
+        local blBottom = math.min(blLeftY, blRightY)
+        local blDivider = content:CreateTexture(nil, "ARTWORK")
+        blDivider:SetColorTexture(0.4, 0.4, 0.4, 0.5)
+        blDivider:SetSize(1, math.abs(blBottom - bottomY) + 4)
+        blDivider:SetPoint("TOPLEFT", content, "TOPLEFT", COL_W + 5, bottomY + 2)
+
+        local totalH = math.abs(blBottom)
+        content:SetSize(fullW, totalH)
+        f:SetSize(W, PAD_TOP + totalH + PAD_BOTTOM)
+    end
+
+    -- bottom menu
+    local guildHint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    guildHint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 20, 62)
+    guildHint:SetText("|cffaaaaaaThis section is currently in experimental mode.|r")
+
+    local syncBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    syncBtn:SetSize(120, 22)
+    syncBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 16, 36)
+    syncBtn:SetText("Sync with guild")
+    syncBtn:SetScript("OnClick", function()
+        if not IsInGuild() then
+            print("|cffffff00Cebulator:|r You are not in a guild.")
+            return
+        end
+        local ok = requestGuildSync()
+        if ok then
+            print("|cffffff00Cebulator:|r Guild sync requested. Refreshing in a moment...")
+            C_Timer.After(2, function()
+                local point,_,_,x,y = f:GetPoint()
+                CebulatorDB.reportPos = {point=point,x=x,y=y}
+                f:Hide()
+                showGuild()
+            end)
+        else
+            local remaining = GUILD_SYNC_COOLDOWN - (time() - lastGuildSync)
+            print(string.format("|cffffff00Cebulator:|r Sync on cooldown. Try again in |cffFFD700%d|r sec.", remaining))
+        end
+    end)
+
+    local summaryBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    summaryBtn:SetSize(100, 22)
+    summaryBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -16, 36)
+    summaryBtn:SetText("Summary")
+    summaryBtn:SetScript("OnClick", function()
+        local point,_,_,x,y = f:GetPoint()
+        CebulatorDB.reportPos = {point=point,x=x,y=y}
+        f:Hide()
+        showReport()
+    end)
 
     local closeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     closeBtn:SetSize(80, 22)
@@ -519,7 +1354,7 @@ local function setWaypoint()
         return
     end
 
-    -- sprawdź czy wszystkie moby zabite
+    -- check if all mobs are killed
     local allKilled = true
     for _, mob in ipairs(zoneData.mobs or {}) do
         if not getMobData(mob).killed then allKilled = false; break end
@@ -717,12 +1552,16 @@ SlashCmdList["CEBULATOR"] = function(msg)
         CebulatorDB.reportPos = false
         if CebulatorReportFrame then CebulatorReportFrame:SetPoint("CENTER") end
         print("|cffffff00Cebulator:|r Report position reset.")
+    elseif cmd == "whatsnew" then
+        CebulatorDB.lastSeenVersion = ""
+        showWhatsNew()
     else
         print("|cffffff00Cebulator commands:|r")
         print("  /cebulator total reset - reset total account summary")
         print("  /cebulator daily reset - reset daily account summary")
         print("  /cebulator streak - show killing streak")
         print("  /cebulator position reset - reset report window position")
+        print("  /cebulator whatsnew - show patch notes")
     end
 end
 
@@ -733,10 +1572,12 @@ frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("CHAT_MSG_LOOT")
 frame:RegisterEvent("LOOT_OPENED")
 frame:RegisterEvent("LOOT_CLOSED")
+frame:RegisterEvent("CHAT_MSG_ADDON")
 
-frame:SetScript("OnEvent", function(self, event, arg1)
+frame:SetScript("OnEvent", function(self, event, arg1, ...)
     if event == "ADDON_LOADED" and arg1 == "Cebulator" then
         initDB()
+        C_ChatInfo.RegisterAddonMessagePrefix(GUILD_PREFIX)
     elseif event == "PLAYER_LOGIN" then
         setup()
         updateStreak()
@@ -747,6 +1588,15 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         if zoneData and not zoneData.mapID then
             zoneData.mapID = C_Map.GetBestMapForUnit("player")
         end
+        -- auto sync guild data on login
+        C_Timer.After(5, function()
+            if IsInGuild() then
+                lastGuildSync = time()
+                guildDecode(guildEncode())
+                C_ChatInfo.SendAddonMessage(GUILD_PREFIX, "REQ", "GUILD")
+                sendGuildData()
+            end
+        end)
     elseif event == "ZONE_CHANGED_NEW_AREA" then
         waypointSet = false
         if coinBtn then updateTargetMacro() end
@@ -791,10 +1641,14 @@ frame:SetScript("OnEvent", function(self, event, arg1)
                 lastLootedMob = targetName
                 onMobKilledForBadLuck(targetName)
                 CebulatorDB.kills = CebulatorDB.kills + 1
+                local dk = CebulatorDB.dailyKills
+                local d = today()
+                if not dk[d] then dk[d] = {} end
+                dk[d][targetName] = (dk[d][targetName] or 0) + 1
                 onMobKilled()
             end
             if targetName == "Umbrafang" then waypointSet = false end
-            -- sprawdź czy wszystkie moby na tej mapie zabite
+            -- check if all mobs in this zone are killed
             local zone = getZone()
             local zoneData = MOBS[zone]
             if zoneData then
@@ -810,5 +1664,17 @@ frame:SetScript("OnEvent", function(self, event, arg1)
         end
     elseif event == "LOOT_CLOSED" then
         lastKilledMob = nil
+    elseif event == "CHAT_MSG_ADDON" then
+        local prefix = arg1
+        if prefix ~= GUILD_PREFIX then return end
+        local msg2, channel, sender = ...
+        if not msg2 then return end
+        if msg2 == "REQ" then
+            sendGuildData()
+            -- relay cached data from other players
+            sendGuildRelay()
+        elseif msg2:sub(1, 4) == "DATA" then
+            guildDecode(msg2)
+        end
     end
 end)
