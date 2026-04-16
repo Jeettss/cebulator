@@ -39,6 +39,7 @@ local coinBtn
 local waypointSet = false
 local showCalendar
 local showGuild
+local reportFrame, calendarFrame, guildFrame
 
 local function today()
     local cest    = time() + 2 * 3600
@@ -265,6 +266,8 @@ local function initDB()
     if not CebulatorDB[today()] then CebulatorDB[today()] = {} end
     if not CebulatorDB.total   then CebulatorDB.total   = {} end
     if not CebulatorDB.minimap then CebulatorDB.minimap = {} end
+    if not CebulatorDB.guildData then CebulatorDB.guildData = {} end
+    guildData = CebulatorDB.guildData
     if not CebulatorDB.coinPos then
         CebulatorDB.coinPos = { point = DEFAULT_COIN_POS.point, x = DEFAULT_COIN_POS.x, y = DEFAULT_COIN_POS.y }
     end
@@ -391,36 +394,12 @@ local function showStreakLogin()
 end
 
 local PATCH_NOTES = {
-    ["1.05"] = {
+    ["1.05.2"] = {
         "What's New in Cebulator!",
         " ",
-        "v1.05",
-        "- Guild Rankings tab (experimental) - see daily and weekly kill/loot rankings",
-        "  from guild members who use Cebulator",
-        "- Guild Bad Luck ranking - total and weekly dry streaks per item",
-        "- Two-column layout in Guild tab - Daily on the left, Weekly on the right",
-        "- Sync with guild button - request fresh data from online guildies (60s cooldown)",
-        "- Auto guild sync on login - data is exchanged automatically",
-        "- Data relay - offline players' data is forwarded by online members",
-        "- BattleTag deduplication - multiple characters on the same account",
-        "  show as one entry in rankings",
-        "- Bottom navigation menu - Summary, Calendar and Guild tabs",
-        "  are now at the bottom of each window",
-        " ",
-        "Check |cffffff00'/cebulator help'|r for detailed commands.",
-    },
-    ["1.04"] = {
-        "What's New in Cebulator!",
-        " ",
-        "v1.04",
-        "- Killing streak system - tracks how many days in a row you hunted a Renowned Beast (account-wide)",
-        "- Login reminder - on login you receive a message about your current streak and whether you still need to hunt today",
-        "- Drop average tracker - total summary now shows average drops per kill",
-        "  (for accurate data, run |cffffff00'/cebulator total reset'|r and |cffffff00'/cebulator daily reset'|r)",
-        "- Waypoint now auto-clears after killing the last tracked beast in the zone",
-        "- Personal records - announces new daily loot records in chat",
-        "- Bad luck counter - tracks kills without a specific drop (visible in report)",
-        "- Report is now a movable popup window instead of chat messages",
+        "v1.05.2",
+        "- Fixed report, calendar and guild windows opening multiple times",
+        "  - they now toggle properly on repeated clicks",
         " ",
         "Check |cffffff00'/cebulator help'|r for detailed commands.",
     },
@@ -564,11 +543,11 @@ local function showReport()
     local version = C_AddOns.GetAddOnMetadata("Cebulator", "Version")
     local day = getDayData()
 
-    if CebulatorReportFrame and CebulatorReportFrame:IsShown() then
-        CebulatorReportFrame:Hide()
+    if reportFrame and reportFrame:IsShown() then
+        reportFrame:Hide()
         return
     end
-    if CebulatorReportFrame then CebulatorReportFrame:Hide(); CebulatorReportFrame:SetParent(nil) end
+    if reportFrame then reportFrame:Hide() end
 
     local W = 500
     local PAD_TOP = 70
@@ -647,7 +626,8 @@ local function showReport()
     end
 
     -- build frame
-    local f = CreateFrame("Frame", "CebulatorReportFrame", UIParent, "BackdropTemplate")
+    local f = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+    reportFrame = f
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -772,11 +752,11 @@ local function firstWeekday(y, m) -- 1=Mon..7=Sun
 end
 
 showCalendar = function(anchorFrame)
-    if CebulatorCalendarFrame and CebulatorCalendarFrame:IsShown() then
-        CebulatorCalendarFrame:Hide()
+    if calendarFrame and calendarFrame:IsShown() then
+        calendarFrame:Hide()
         return
     end
-    if CebulatorCalendarFrame then CebulatorCalendarFrame:Hide(); CebulatorCalendarFrame:SetParent(nil) end
+    if calendarFrame then calendarFrame:Hide() end
 
     local utc     = time() + 2*3600
     local shifted = utc - 6*3600
@@ -789,7 +769,8 @@ showCalendar = function(anchorFrame)
     local W    = CELL * COLS + 40
     local calViewYear, calViewMonth = curYear, curMonth
 
-    local f = CreateFrame("Frame", "CebulatorCalendarFrame", UIParent, "BackdropTemplate")
+    local f = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+    calendarFrame = f
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -1014,11 +995,11 @@ showCalendar = function(anchorFrame)
 end
 
 showGuild = function()
-    if CebulatorGuildFrame and CebulatorGuildFrame:IsShown() then
-        CebulatorGuildFrame:Hide()
+    if guildFrame and guildFrame:IsShown() then
+        guildFrame:Hide()
         return
     end
-    if CebulatorGuildFrame then CebulatorGuildFrame:Hide(); CebulatorGuildFrame:SetParent(nil) end
+    if guildFrame then guildFrame:Hide() end
 
     local W = 620
     local PAD_TOP = 70
@@ -1075,7 +1056,8 @@ showGuild = function()
     end
 
     -- build frame
-    local f = CreateFrame("Frame", "CebulatorGuildFrame", UIParent, "BackdropTemplate")
+    local f = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+    guildFrame = f
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -1553,7 +1535,7 @@ SlashCmdList["CEBULATOR"] = function(msg)
             s.best, s.best == 1 and "" or "s"))
     elseif cmd == "position reset" then
         CebulatorDB.reportPos = false
-        if CebulatorReportFrame then CebulatorReportFrame:SetPoint("CENTER") end
+        if reportFrame then reportFrame:SetPoint("CENTER") end
         print("|cffffff00Cebulator:|r Report position reset.")
     elseif cmd == "whatsnew" then
         CebulatorDB.lastSeenVersion = ""
